@@ -1,0 +1,76 @@
+# Examples
+
+Example implementations of the Unified Harness Protocol, grouped by the
+[role](versions/2026-09-12/architecture.md#1-roles) each fills. Listings are
+community-maintained by pull request and **do not imply endorsement or
+certification** — the only conformance claim that means anything is
+[passing the conformance suite](conformance/README.md).
+
+<div class="impl-actions">
+<a class="impl-cta" href="#listing-criteria">Add an implementation</a>
+<a class="impl-crit" href="#listing-criteria">Listing criteria</a>
+</div>
+
+## Example servers
+
+A server runs one or more harnesses behind the contract. Guide: [Implement a server](SERVING.md).
+
+<div class="impl-list">
+
+<div class="impl-card" id="harnessrouter-ce">
+<div class="impl-head"><a href="https://github.com/HarnessRouter/harnessrouter"><b>HarnessRouter Community Edition</b></a><span class="role role-server">Server</span></div>
+<p>Open-source server that puts 26 existing harness bases, among them Codex, Claude Code, Hermes, OpenCode and Gemini CLI, behind the UHP contract (<a href="https://github.com/HarnessRouter/harnessrouter/blob/main/docs/support-matrix.md">support matrix</a>). HarnessRouter · Apache-2.0.</p>
+<p class="impl-meta">UHP 2026-09-12</p>
+</div>
+
+<div class="impl-card" id="harnessrouter">
+<div class="impl-head"><a href="https://harnessrouter.ai"><b>HarnessRouter</b></a><span class="role role-server">Server</span></div>
+<p>The hosted service: sixteen harness bases behind the UHP contract with a console, billing and shared sessions, at <code>https://api.harnessrouter.ai</code>. HarnessRouter · commercial, free tier.</p>
+<p class="impl-meta">UHP 2026-09-12</p>
+</div>
+
+<div class="impl-card" id="superqode">
+<div class="impl-head"><a href="https://github.com/SuperagenticAI/superqode"><b>SuperQode</b></a><span class="role role-server">Server</span></div>
+<p>Harness-engineering framework whose own harness speaks UHP natively through <code>superqode serve uhp</code>, binding one configured HarnessSpec. SuperagenticAI · Apache-2.0.</p>
+<p class="impl-meta">UHP 2026-09-12</p>
+</div>
+
+</div>
+
+## Example clients
+
+A client drives a UHP server. Guide: [Implement a client](CONNECTING.md).
+
+<div class="impl-list">
+
+<div class="impl-card" id="superqode-client">
+<div class="impl-head"><a href="https://github.com/SuperagenticAI/superqode"><b>SuperQode</b></a><span class="role role-client">Client</span></div>
+<p>Harness-engineering framework that connects to a UHP server via <code>superqode connect uhp</code>. SuperagenticAI · Apache-2.0.</p>
+<p class="impl-meta">UHP 2026-09-12</p>
+</div>
+
+</div>
+
+## Listing criteria
+
+A listing is a factual row, not a certification. Open a pull request against
+this file in the [repository](https://github.com/HarnessRouter/harnessrouter)
+adding one card. To merge, an entry needs:
+
+1. A public, usable release — a repository or a product page, not an announcement.
+2. The UHP version the implementation targets.
+3. A maintainer contact reachable from the linked page.
+4. The role it fills: **Server** (runs harnesses behind the contract), **Client**
+   (drives a UHP server), **SDK** (a library for building either), or a
+   combination.
+
+A conformance level appears on a listing only once UHP publishes reproducible
+test evidence for that implementation; until then, absence of a level is
+expected, not a mark against the entry. The evidence is a report produced by
+the `conformance-measure` workflow and landed under `conformance/reports/<slug>/`;
+give your card `id="<slug>"` and the site shows the measured level and badge on
+it, generated from the report. How to get measured, and the badge to embed, are
+on the [conformance page](conformance/README.md#measured-implementations).
+
+Building an implementation? Start with [Implement a server](SERVING.md) or
+[Implement a client](CONNECTING.md).

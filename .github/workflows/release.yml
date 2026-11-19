@@ -1,0 +1,446 @@
+# Publish the all-in-one image to Docker Hub, for both architectures people actually use.
+#
+# This exists because the alternative was a person minting a Docker Hub token by hand for every
+# release, pasting it into a shell on a build VM, and then having to remember to revoke it. That
+# is three chances to leak a credential and one chance to forget, per release.
+#
+# Here the token is a repository secret: it is written once, never read back, and never travels
+# through anyone's terminal or transcript. Publishing becomes `git tag v0.4.3 && git push --tags`.
+#
+# WHY THE BUILD FANS OUT AND THE TAG DOES NOT
+#
+# Each architecture builds on a runner of its own kind — no QEMU, so arm64 is not the slow long
+# pole it becomes under emulation — and each smoke-tests ITSELF on that runner. That second part
+# is the point: the gate that catches "the agent CLIs cannot install on a fresh volume" had only
+# ever run on amd64, so the guarantee was unproven on the architecture most developers have.
+#
+# The version tag is created ONCE, at the end, from both digests, and only if both smoke tests
+# passed. Publishing amd64 under the real tag and adding arm64 later would mean the tag names two
+# different things at two different times: whoever pulled during the window got a different
+# artifact and had no way to know. An arm64 user in that window would silently get the emulated
+# image and never learn a native one existed.
+#
+# ONE-TIME SETUP
+#   1. hub.docker.com → account settings → Personal access tokens → Generate, "Read & Write".
+#   2. This repo → Settings → Secrets and variables → Actions → New repository secret:
+#        DOCKERHUB_USERNAME = harnessrouter
+#        DOCKERHUB_TOKEN    = the token from step 1
+#   Nothing after that: the tag drives the build, and the last step turns it into a GitHub
+#   Release so the Releases page matches what is actually on Docker Hub.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, without the v (e.g. 0.4.3)'
+        required: true
+      latest:
+        description: 'Also move the :latest tag'
+        type: boolean
+        default: true
+
+# The manifest job creates the GitHub Release at the end, so it needs write access to them.
+permissions:
+  contents: write
+
+env:
+  IMAGE: harnessrouter/harnessrouter
+
+jobs:
+  # ── what we are about to ship ──────────────────────────────────────────────────────────────
+  # Resolved once, so both architectures bake the SAME skills and kits. Resolving per-arch would
+  # let a commit land between the two builds and produce a manifest whose halves disagree.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      skills: ${{ steps.refs.outputs.skills }}
+      kits: ${{ steps.refs.outputs.kits }}
+    steps:
+      - name: Work out the version
+        id: v
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            V='${{ inputs.version }}'
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          case "$V" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::'$V' is not a semver version"; exit 1 ;;
+          esac
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Publishing $V"
+
+      # The skills and the kits are pulled from their own repositories at build time, and a release
+      # must never ship the catalogue some earlier build happened to fetch. Resolving both heads to
+      # a sha HERE is what guarantees that: the sha is a build arg, so the layer rebuilds exactly
+      # when the repository moves, and the run log records precisely what shipped.
+      #
+      # The Dockerfile used to do this itself with `ADD https://api.github.com/...`. That call
+      # carries no credentials, GitHub allows 60 an hour per IP, and Actions runners share a busy
+      # pool — so the build died on "failed to load cache key: invalid response status 403". Here
+      # the same request is authenticated by the token every workflow already has.
+      - name: Resolve what we are about to ship
+        id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          resolve() {
+            sha=$(gh api "repos/HarnessRouter/$1/commits/main" --jq .sha)
+            case "$sha" in
+              [0-9a-f][0-9a-f]*) ;;
+              *) echo "::error::could not resolve HarnessRouter/$1 main"; exit 1 ;;
+            esac
+            echo "$2=$sha" >> "$GITHUB_OUTPUT"
+            echo "$1 -> $sha"
+          }
+          resolve skills      skills
+          resolve starter-kit kits
+
+  # ── one runner per architecture ────────────────────────────────────────────────────────────
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false          # a failure on one arch should still show the other's result
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm     # native; QEMU here would take the best part of an hour
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image is ~2 GB unpacked and the runner ships with several GB of Android SDK and .NET
+      # nobody here needs. Without this the build dies on "no space left on device" somewhere in
+      # the middle, which reads like a broken Dockerfile.
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          df -h / | tail -1
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Pushed BY DIGEST, with no tag. Nothing a user can pull exists until the merge job says so.
+      #
+      # ONE more attempt, after a pause, when the first failed upstream and for no other reason: the
+      # registry lost a layer upload ("error writing layer blob: not_found", Docker Hub, 2026-11-09),
+      # answered 5xx, or reset the connection. A failure of the build itself, or a 4xx, fails here
+      # as before. The second attempt is the same step with the same inputs; keep the two `with:`
+      # blocks identical.
+      - name: Build and push by digest
+        id: build1
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            HR_SKILLS_REF=${{ needs.plan.outputs.skills }}
+            HR_KITS_REF=${{ needs.plan.outputs.kits }}
+            HR_VERSION=${{ needs.plan.outputs.version }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Decide whether the build failed upstream
+        if: steps.build1.outcome == 'failure'
+        run: |
+          set -uo pipefail
+          # The failed build's own error, from the builder's record of it. No record, no retry.
+          MSG=$(docker buildx history inspect --format json 2>/dev/null | jq -r '.Error.Message // ""' || true)
+          echo "first attempt: ${MSG:-no build record}"
+          UPSTREAM='error writing layer blob: not_found|unexpected status( code)?[^:]*: 5[0-9][0-9]|[^0-9]5[0-9][0-9] (Bad Gateway|Service Unavailable|Gateway Time-?out|Internal Server Error)|[Cc]onnection reset'
+          CLIENT='unexpected status( code)?[^:]*: 4[0-9][0-9]|[^0-9]4[0-9][0-9] (Bad Request|Unauthorized|Forbidden|Not Found|Too Many Requests)'
+          if grep -Eq "$UPSTREAM" <<<"$MSG" && ! grep -Eq "$CLIENT" <<<"$MSG"; then
+            echo "::warning::the registry failed the push on ${{ matrix.arch }}; building once more in 30 s"
+            STATUS=$(grep -Eo 'not_found|5[0-9][0-9]|[Cc]onnection reset' <<<"$MSG" | head -1)
+            echo "RETRIED build-push ${{ matrix.arch }}: first attempt ${STATUS:-upstream}"
+            sleep 30
+          else
+            echo "::error::the build failed on ${{ matrix.arch }}, and not upstream"
+            exit 1
+          fi
+
+      - name: Build and push by digest (second attempt)
+        id: build2
+        if: steps.build1.outcome == 'failure'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            HR_SKILLS_REF=${{ needs.plan.outputs.skills }}
+            HR_KITS_REF=${{ needs.plan.outputs.kits }}
+            HR_VERSION=${{ needs.plan.outputs.version }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      # A published image that cannot install its agent CLIs is the failure this project has
+      # already shipped once (a root-owned npm cache in /home/agent). It was invisible because
+      # every instance that was checked had a data volume from before the fault. So the release
+      # gate runs the image the way a NEW user does: empty volume, and read what it says — and now
+      # it does that on EACH architecture, on hardware of that architecture.
+      - name: Smoke-test this architecture on a fresh volume
+        env:
+          DIGEST: ${{ steps.build2.outputs.digest || steps.build1.outputs.digest }}
+        run: |
+          set -euo pipefail
+          REF="${{ env.IMAGE }}@$DIGEST"
+          docker rm -f smoke 2>/dev/null || true
+          docker volume rm smoke-data 2>/dev/null || true
+          # No HR_SECRET_KEY: the image gets one at its first start, the way a new install does.
+          docker run -d --name smoke -v smoke-data:/data "$REF"
+          # A fresh volume installs every default base before it prints this line. Five minutes was
+          # enough for twenty bases and no longer is: from the four added in #448 on, amd64 was still
+          # installing when the wait ended, and the gate then blamed the first base it checked
+          # ("claude did not install"), three candidates running. Fifteen minutes, and a timeout says
+          # so rather than naming a base: 0.41.6's amd64 smoke step took 11m53s with twelve, and each
+          # base installing as its own uid (#623) adds about 3%.
+          for i in $(seq 1 180); do
+            # grep reads the whole log (no -q): -q exits at the first match, docker logs is then cut off
+            # writing the lines after it, and pipefail fails the pipeline although the line was there
+            # (0.38.6's amd64 gate, a second start up in ten seconds, failed exactly so).
+            docker logs smoke 2>&1 | grep "backends available" >/dev/null && break
+            sleep 5
+          done
+          docker logs smoke 2>&1 | tail -30
+          LINE=$(docker logs smoke 2>&1 | grep "backends available" | tail -1 || true)
+          [ -n "$LINE" ] || { echo "::error::the installs did not finish within 15 minutes on ${{ matrix.arch }}"; exit 1; }
+          echo "$LINE"
+          # EVERY default base, read from the entrypoint rather than listed here: this checked five
+          # of thirty, and an installer that fails is one WARN line and a base that quietly leaves
+          # the catalogue, on one architecture only (#623). Each must also carry its stamp.
+          DEFAULT=$(sed -n 's/^export HR_BACKENDS="\${HR_BACKENDS:-\(.*\)}"$/\1/p' docker/entrypoint.sh)
+          [ -n "$DEFAULT" ] || { echo "::error::could not read the default HR_BACKENDS from docker/entrypoint.sh"; exit 1; }
+          not_installed() {   # <backends available line>: the default bases it lacks, or without a stamp
+            local avail=" ${1#*backends available:} " b out=""
+            for b in ${DEFAULT//,/ }; do
+              case "$avail" in *" $b "*) ;; *) out="$out $b" ;; esac
+              docker exec smoke test -s "/data/agent-tools/.versions/$b" || out="$out $b(no stamp)"
+            done
+            printf '%s' "$out"
+          }
+          bad=$(not_installed "$LINE")
+          # ONE more start, after a pause, when every install that failed failed upstream: a 5xx or a
+          # reset connection from where it downloads (GitHub's anonymous 504s on a release asset, for
+          # goose and for MiniMax Code's tarball, 2026-11-09). A start installs exactly the bases that
+          # have no stamp, through the same pinned, checksummed install. A 4xx, a checksum or any other
+          # failure is not retried, and one failure of that kind means no retry for any.
+          if [ -n "$bad" ]; then
+            UPSTREAM='returned error: 5[0-9][0-9]|error code E5[0-9][0-9]|[^0-9]5[0-9][0-9] (Bad Gateway|Service Unavailable|Gateway Time-?out|Internal Server Error)|server error \(5[0-9][0-9]|ECONNRESET|[Cc]onnection reset'
+            CLIENT='returned error: 4[0-9][0-9]|error code E4[0-9][0-9]|[^0-9]4[0-9][0-9] (Bad Request|Unauthorized|Forbidden|Not Found|Too Many Requests)|client error \(4[0-9][0-9]'
+            # Each failed install's report: its WARN line and the indented lines under it.
+            FAILS=$(docker logs smoke 2>&1 | awk '/WARN: could not install/ {n++; inb=1; print n "\t" $0; next}
+                                                  inb && /^\[[^]]*\]   / {print n "\t" $0; next} {inb=0}')
+            N=$(cut -f1 <<<"$FAILS" | sort -u | grep -c . || true)
+            retry=$([ "$N" -gt 0 ] && echo 1 || echo 0)
+            for k in $(seq 1 "$N"); do
+              one=$(awk -F'\t' -v k="$k" '$1 == k' <<<"$FAILS")
+              grep -Eq "$UPSTREAM" <<<"$one" && ! grep -Eq "$CLIENT" <<<"$one" || retry=0
+            done
+            if [ "$retry" = 1 ]; then
+              echo "::warning::upstream fault installing on ${{ matrix.arch }}:$bad; one more start in 30 s"
+              STATUS=$(grep -Eo 'E?5[0-9][0-9]|ECONNRESET|[Cc]onnection reset' <<<"$FAILS" | head -1)
+              echo "RETRIED install ${{ matrix.arch }}:$bad: first attempt ${STATUS:-upstream}"
+              sleep 30
+              SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              docker restart smoke >/dev/null
+              for i in $(seq 1 72); do
+                docker logs --since "$SINCE" smoke 2>&1 | grep "backends available" >/dev/null && break
+                sleep 5
+              done
+              docker logs --since "$SINCE" smoke 2>&1 | tail -30
+              LINE=$(docker logs --since "$SINCE" smoke 2>&1 | grep "backends available" | tail -1 || true)
+              [ -n "$LINE" ] || { echo "::error::the second try did not finish within 6 minutes on ${{ matrix.arch }}"; exit 1; }
+              echo "$LINE"
+              bad=$(not_installed "$LINE")
+            fi
+          fi
+          [ -z "$bad" ] || { echo "::error::did not install on ${{ matrix.arch }}:$bad"; exit 1; }
+          # A second start installs nothing and runs nothing to find that out: the stamps are read.
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          docker restart smoke >/dev/null
+          for i in $(seq 1 60); do
+            docker logs --since "$SINCE" smoke 2>&1 | grep 'backends available' >/dev/null && break
+            sleep 5
+          done
+          docker logs --since "$SINCE" smoke 2>&1 | grep 'backends available' >/dev/null \
+            || { echo "::error::the second start did not come up within 5 minutes on ${{ matrix.arch }}"; exit 1; }
+          AGAIN=$(docker logs --since "$SINCE" smoke 2>&1 | sed '/backends available/q' | grep -E '\] (installing|WARN)' || true)
+          [ -z "$AGAIN" ] || { echo "$AGAIN"; echo "::error::the second start on ${{ matrix.arch }} reinstalled or warned"; exit 1; }
+          docker exec smoke ls /opt/harnessrouter/kits
+          # What this image actually holds, not what a lockfile asked for: a build once copied an LGPL library in
+          # that nobody had asked for by name, and NOTICE said otherwise for three months.
+          for f in NOTICE LICENSE THIRD-PARTY-console.txt; do
+            docker exec smoke test -s "/app/$f" || { echo "::error::the image doesn't carry $f on ${{ matrix.arch }}"; exit 1; }
+          done
+          docker cp scripts/check-licenses.py smoke:/tmp/check-licenses.py
+          docker exec smoke python3 -I /tmp/check-licenses.py --image \
+            || { echo "::error::the image holds something not under a permissive licence on ${{ matrix.arch }}"; exit 1; }
+          # Root never runs what the product user can change, read off the running container.
+          docker exec --privileged -i smoke sh < scripts/check-root-boundary.sh \
+            || { echo "::error::root runs something the product user can change on ${{ matrix.arch }}"; exit 1; }
+          # The runner starts with no secret in its environment (docker/entrypoint.sh). Names only are read,
+          # and only a count is printed.
+          docker exec --privileged smoke python3 -I -c '
+          import glob, re
+          pat = re.compile(r"^(HARNESS_INTERNAL_KEY|HR_AUTH_.*|HR_SECRET_KEY|HR_SESSION_KEY|HR_POOL_.*)$|_API_KEY$|_SECRET(_|$)|_TOKEN$|PASSWORD|^AWS_BEARER_TOKEN_|^GOOGLE_APPLICATION_CREDENTIALS$|_KEY$|_PASS(WORD)?$|_PWD$|_CREDENTIALS?$|_DSN$", re.I)
+          seen = bad = 0
+          for d in glob.glob("/proc/[0-9]*"):
+              try:
+                  if b"uvicorn\0server:app" not in open(d + "/cmdline", "rb").read():
+                      continue
+                  names = [kv.split(b"=", 1)[0].decode() for kv in open(d + "/environ", "rb").read().split(b"\0") if kv]
+              except OSError:
+                  continue
+              seen += 1
+              bad += sum(1 for n in names if pat.search(n))
+          print(f"runner processes: {seen}, secret-shaped names in their environment: {bad}")
+          raise SystemExit(0 if seen and not bad else 1)
+          ' || { echo "::error::the runner holds a secret in its environment on ${{ matrix.arch }}"; exit 1; }
+          # Nothing left to read in a session: a canary in every credential, one turn per base, and each
+          # looked for in the session's processes and files, on the volume and in what a client reads. One
+          # architecture is enough: where a credential goes doesn't depend on the CPU.
+          if [ "${{ matrix.arch }}" = amd64 ]; then
+            docker cp scripts/secret-canary-gate.py smoke:/tmp/secret-canary-gate.py
+            docker exec --privileged smoke python3 -I /tmp/secret-canary-gate.py --jobs 4 \
+              || { echo "::error::a credential reached a session, or the gate could not see one"; exit 1; }
+          fi
+          # The architecture is asserted, not assumed: a QEMU fallback would otherwise pass here
+          # silently and ship an emulated image under the native manifest.
+          GOT=$(docker image inspect "$REF" --format '{{.Architecture}}')
+          [ "$GOT" = "${{ matrix.arch }}" ] || { echo "::error::built $GOT, expected ${{ matrix.arch }}"; exit 1; }
+          echo "${{ matrix.arch }} ok"
+
+      - name: Hand the digest to the merge
+        run: |
+          mkdir -p /tmp/digests
+          echo "${{ steps.build2.outputs.digest || steps.build1.outputs.digest }}" > "/tmp/digests/${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  # ── the tag, created once, from both ───────────────────────────────────────────────────────
+  merge:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create the manifest
+        run: |
+          set -euo pipefail
+          V='${{ needs.plan.outputs.version }}'
+          REFS=""
+          for f in /tmp/digests/*; do
+            REFS="$REFS ${{ env.IMAGE }}@$(cat "$f")"
+            echo "$(basename "$f") $(cat "$f")"
+          done
+          [ -n "$REFS" ] || { echo "::error::no digests to merge"; exit 1; }
+          TAGS="-t ${{ env.IMAGE }}:$V"
+          if [ "${{ github.event_name }}" != workflow_dispatch ] || [ "${{ inputs.latest }}" = true ]; then
+            TAGS="$TAGS -t ${{ env.IMAGE }}:latest"
+          fi
+          docker buildx imagetools create $TAGS $REFS
+
+      # Read the published manifest back: the promise of this workflow is that the tag serves both
+      # architectures, and only the registry can confirm it.
+      - name: Prove the tag serves both architectures
+        run: |
+          set -euo pipefail
+          V='${{ needs.plan.outputs.version }}'
+          PLAT=$(docker buildx imagetools inspect "${{ env.IMAGE }}:$V" --raw \
+                 | jq -r '.manifests[]?.platform | select(.os=="linux") | "\(.os)/\(.architecture)"' | sort -u)
+          echo "$PLAT"
+          echo "$PLAT" | grep -qx 'linux/amd64' || { echo "::error::amd64 missing from $V"; exit 1; }
+          echo "$PLAT" | grep -qx 'linux/arm64' || { echo "::error::arm64 missing from $V"; exit 1; }
+          {
+            echo "### harnessrouter $V"
+            echo '```'
+            echo "docker pull ${{ env.IMAGE }}:$V"
+            echo '```'
+            echo "$PLAT" | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A git tag is NOT a GitHub Release. This file said "a tag is a release", which is true of
+      # how we publish — the tag is what triggers the build — but the Releases page lists Release
+      # objects only, so it silently stopped at v0.9.1 while v0.10.0 and v0.11.0 shipped to Docker
+      # Hub. Anyone reading the repo saw a project that looked four days stale and two versions
+      # behind what it actually served.
+      #
+      # Created LAST, after the manifest has been read back from the registry: a Release that
+      # exists for an image nobody can pull is worse than no Release, because it is the page
+      # people trust.
+      #
+      # On EVERY run, a dispatched one included. This step used to be skipped for
+      # workflow_dispatch "which has no tag to attach to", and the result was the same silent
+      # staleness the paragraph above describes, by another door: 0.18.0 and 0.18.1 were published
+      # to Docker Hub by dispatch on 2026-09-17 and the repository showed v0.17.3 as its latest
+      # tag and Release until someone asked why. A dispatched run has no tag YET, so the Release
+      # makes it, at the commit this run built (--target; ignored when the tag already exists, as
+      # it does on a tag push). A tag created with this workflow's own token does not start
+      # another run, so publishing by dispatch does not build twice.
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          V='${{ needs.plan.outputs.version }}'
+          # --repo is REQUIRED here: this job never checks the source out (it only downloads the
+          # per-arch digests and talks to the registry), so gh has no git remote to infer from and
+          # every call dies "not a git repository". Adding a checkout just to satisfy gh would
+          # clone the tree for nothing.
+          if gh release view "v$V" --repo "$REPO" >/dev/null 2>&1; then
+            echo "release v$V already exists"; exit 0
+          fi
+          # WHICH RELEASE THE REPOSITORY CALLS "LATEST" is decided here, not left to GitHub, which
+          # gives the badge to the newest Release that is not marked a pre-release. A candidate
+          # (0.30.0-rc.3, built from a feature branch to be measured on a test instance) is not
+          # marked anything unless this step marks it, so twice in one day the repository's Latest
+          # release, its /releases/latest link and its sidebar pointed at an unreleased branch's
+          # candidate: 0.29.0-rc.5 on 2026-10-03, then 0.30.0-rc.3 hours after 0.29.0 itself was
+          # published. A version with a pre-release part (anything after a hyphen, the semver rule)
+          # is a pre-release and never Latest. A numbered version is Latest exactly when this run
+          # also moves the image's :latest tag: always on a tag push, and on a dispatch unless
+          # `latest` was unticked, which is how a fix for an older line is published without
+          # displacing the newest one.
+          latest=true
+          if [ "${{ github.event_name }}" = workflow_dispatch ] && [ "${{ inputs.latest }}" != true ]; then
+            latest=false
+          fi
+          case "$V" in
+            *-*) flags=(--prerelease --latest=false) ;;
+            *)   flags=(--latest="$latest") ;;
+          esac
+          # --generate-notes works out the previous tag itself; passing --notes-start-tag from a
+          # `gh release list` subshell added a second thing that needed the repo and could fail.
+          gh release create "v$V" --repo "$REPO" --title "v$V" --generate-notes --target "$GITHUB_SHA" "${flags[@]}"

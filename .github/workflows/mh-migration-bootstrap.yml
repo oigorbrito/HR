@@ -50,29 +50,30 @@ jobs:
           test ! -e .github/workflows/upstream-tracker.yml
           test ! -e .github/scripts/sync-upstream.py
 
-          # Refuse to migrate an actual .env file, but retain documented examples.
-          if find . -type f -name '.env' -not -name '.env.example' -print -quit | grep -q .; then
+          # Refuse to migrate an actual .env file.
+          if find . -type f -name '.env' -print -quit | grep -q .; then
             echo "Refusing migration: a .env file exists."
             exit 1
           fi
 
           mkdir -p docs/migration
           FILE_COUNT="$(find . -type f -not -path './.git/*' | wc -l | tr -d ' ')"
-          cat > docs/migration/MH-SNAPSHOT.md <<EOF
+          cat > docs/migration/MH-SNAPSHOT.md <<'EOF'
           # MH snapshot imported into HR
 
           - Source repository: https://github.com/oigorbrito/mh
           - Source branch: main
-          - Source commit: ${SOURCE_SHA}
+          - Source commit: __SOURCE_SHA__
           - Snapshot method: working-tree snapshot; no MH commit history or old PRs imported
           - New history: one independent root commit
-          - Excluded own change: `.github/workflows/upstream-tracker.yml`
-          - Exclusion reason: it invokes `.github/scripts/sync-upstream.py`, absent from the source tree
-          - Source files copied before this report: ${FILE_COUNT}
-          - Validation scope: exact source SHA, orphan history, no real `.env` file, and migration metadata whitespace check; application tests are separate
+          - Excluded own change: .github/workflows/upstream-tracker.yml
+          - Exclusion reason: it invokes .github/scripts/sync-upstream.py, absent from the source tree
+          - Source files copied before this report: __FILE_COUNT__
+          - Validation scope: exact source SHA, orphan history, no real .env file, and migration metadata whitespace check; application tests are separate
 
           The original HR template and MH repository are retained on their pre-migration backup branches.
           EOF
+          sed -i "s/__SOURCE_SHA__/$SOURCE_SHA/; s/__FILE_COUNT__/$FILE_COUNT/" docs/migration/MH-SNAPSHOT.md
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

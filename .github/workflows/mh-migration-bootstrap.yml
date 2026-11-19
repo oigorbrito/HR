@@ -1,0 +1,88 @@
+name: Build independent HR snapshot from MH
+
+on:
+  push:
+    branches: [bootstrap/mh-migration]
+    paths:
+      - ".github/workflows/mh-migration-bootstrap.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mh-to-hr-clean-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out HR bootstrap repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch and verify the exact MH source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/oigorbrito/mh.git /tmp/mh-source
+          SOURCE_SHA="$(git -C /tmp/mh-source rev-parse HEAD)"
+          EXPECTED_SHA="0f627064d17f24d3b4732d02837131b0f06e99d4"
+          test "$SOURCE_SHA" = "$EXPECTED_SHA"
+          echo "SOURCE_SHA=$SOURCE_SHA" >> "$GITHUB_ENV"
+
+      - name: Create an orphan snapshot branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git switch --orphan migration/mh-clean-history
+          git rm -rf . >/dev/null 2>&1 || true
+          git clean -fdx
+          rsync -a --delete --exclude='.git' /tmp/mh-source/ ./
+          rm -f .github/workflows/upstream-tracker.yml
+
+          # The only commit authored by oigorbrito in the 100 newest MH commits
+          # adds this workflow. It invokes a script absent from MH, so exclude it.
+          test ! -e .github/workflows/upstream-tracker.yml
+          test ! -e .github/scripts/sync-upstream.py
+
+          # Refuse to migrate an actual .env file.
+          if find . -type f -name '.env' -not -path './.git/*' -print -quit | grep -q .; then
+            echo "Refusing migration: a .env file exists."
+            exit 1
+          fi
+
+          mkdir -p docs/migration
+          FILE_COUNT="$(find . -type f -not -path './.git/*' | wc -l | tr -d ' ')"
+          cat > docs/migration/MH-SNAPSHOT.md <<EOF
+          # MH snapshot imported into HR
+
+          - Source repository: https://github.com/oigorbrito/mh
+          - Source branch: main
+          - Source commit: ${SOURCE_SHA}
+          - Snapshot method: tracked working-tree snapshot; no MH commit history or old PRs imported
+          - New history: one independent root commit
+          - Excluded own change: `.github/workflows/upstream-tracker.yml`
+          - Exclusion reason: it invokes `.github/scripts/sync-upstream.py`, which is absent from the source tree
+          - Source files copied before this report: ${FILE_COUNT}
+          - Validation scope: exact source SHA, orphan history, no `.env` file, whitespace check; application tests are not claimed by this job
+
+          The original HR template and MH repository are retained on their pre-migration backup branches.
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "Create independent HR baseline from MH snapshot"
+
+          test "$(git rev-list --count HEAD)" = "1"
+          test "$(git rev-list --parents -n 1 HEAD | wc -w | tr -d ' ')" = "1"
+          git push origin HEAD:refs/heads/migration/mh-clean-history
+
+          echo "Created clean root commit: $(git rev-parse HEAD)"
+          echo "Tracked files: $(git ls-files | wc -l | tr -d ' ')"

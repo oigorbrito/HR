@@ -1,4 +1,4 @@
-# Run every test suite the repository carries, on every pull request and every push to main.
+# Run every test suite on pull requests and pushes to main or the independent migration candidate.
 #
 # This exists because until now nothing did: `release.yml` gates what ships, but the tests in
 # gateway/tests, runner/tests, protocol/conformance/tests and ui only ran when someone remembered
@@ -14,7 +14,7 @@ name: tests
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, migration/mh-clean-history]
 
 permissions:
   contents: read

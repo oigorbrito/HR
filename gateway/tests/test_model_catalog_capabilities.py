@@ -52,7 +52,7 @@ def _vendor_models() -> dict[str, dict[str, str]]:
         reslug = eval(r.group(1), {"__builtins__": {}}, {})  # noqa: S307
         tables["openrouter"] = {c: reslug.get(c, v) for c, v in tables["openrouter"].items()}
     # ... and the ids OpenRouter has no channel for come off its table at import, like TokenRouter's.
-    n = re.search(r"_OPENROUTER_NO_CHANNEL = (\{.*?\})\n", src, re.S)
+    n = re.search(r"_OPENROUTER_NO_CHANNEL(?::\s*set\[str\])?\s*=\s*(\{.*?\})\n", src, re.S)
     if n:
         gone = eval(n.group(1), {"__builtins__": {}}, {})  # noqa: S307
         tables["openrouter"] = {c: v for c, v in tables["openrouter"].items() if c not in gone}

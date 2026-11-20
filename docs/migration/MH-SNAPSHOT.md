@@ -16,3 +16,11 @@
 - HR template backup: `backup/pre-MH-migration-2026-11-19` in HR
 
 This is a source snapshot, not an upstream merge. Upstream files and modes are preserved except for the explicitly identified broken workflow. Application validation is separate and is not implied by this manifest.
+
+## Validation evidence
+
+- GitHub Actions run: https://github.com/oigorbrito/HR/actions/runs/44596905705
+- Run conclusion: success; all 10 jobs completed successfully, including the root-only runner tests.
+- Exact tested commit: `34293a158113709661a359d4625e7ae38b42fd6b` on `validation/mh-snapshot`.
+- The validation branch was based on the imported source snapshot and changed the workflow push trigger only to permit isolated execution. This run validates the application tree, but it does not include the later-added `docs/HR-ARCHITECTURE.md` commit.
+- A separate push-triggered run on `migration/mh-clean-history` is required to qualify the final candidate head; do not treat the earlier run alone as validation of that later head.

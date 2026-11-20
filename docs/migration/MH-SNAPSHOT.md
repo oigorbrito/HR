@@ -19,8 +19,18 @@ This is a source snapshot, not an upstream merge. Upstream files and modes are p
 
 ## Validation evidence
 
-- GitHub Actions run: https://github.com/oigorbrito/HR/actions/runs/44596905705
-- Run conclusion: success; all 10 jobs completed successfully, including the root-only runner tests.
-- Exact tested commit: `34293a158113709661a359d4625e7ae38b42fd6b` on `validation/mh-snapshot`.
-- The validation branch was based on the imported source snapshot and changed the workflow push trigger only to permit isolated execution. This run validates the application tree, but it does not include the later-added `docs/HR-ARCHITECTURE.md` commit.
-- A separate push-triggered run on `migration/mh-clean-history` is required to qualify the final candidate head; do not treat the earlier run alone as validation of that later head.
+- Final candidate CI run: https://github.com/oigorbrito/HR/actions/runs/44666200244
+- Tested commit: `dbd085405f1123fbbb185c61c5ceb943a9ef032f` on `migration/mh-clean-history`.
+- Conclusion: success; all 10 jobs passed, including gateway, runner, root-only runner tests, integration, console build/type-check, protocol conformance, site build, install pins, canary and deploy checks.
+- The first candidate run exposed one stale OpenRouter model route: `grok-build-0.1 -> x-ai/grok-build-0.1` was absent from the live `GET /api/v1/models` response. The legacy detail page still resolved, but the model was not in the provider's live catalogue. The OpenRouter route is now excluded fail-closed; the model remains in the broader catalog for other providers that still expose it.
+- The capability test's source parser previously failed to recognize the typed `_OPENROUTER_NO_CHANNEL: set[str]` declaration. Its regex now accepts the annotation, so it tests the actual exclusion table instead of silently ignoring it.
+- Run 44666200244 is the qualification evidence for the application tree and these corrections. The manifest-only update that records this evidence does not change application code.
+- The migration validation did not rerun Pi, Marshall, Orca, fencing, idempotency or CAS/OCC benchmarks.
+
+## Promotion gate
+
+- Current default branch remains `main`, pointing to the pre-migration HR template backup commit.
+- Active repository ruleset `27663587` targets `~DEFAULT_BRANCH` and requires the status contexts `lint`, `build`, `test`, `cargo test`, and `ci`. The imported tree has no `Cargo.toml`, and its workflow emits different job names.
+- The ruleset has no bypass actors. The available GitHub operations in this session can inspect rulesets but cannot edit them or change the repository's default branch.
+- Promotion is therefore intentionally not performed by moving refs around the active non-fast-forward/deletion rules. The ruleset/default-branch change remains an administrative gate.
+- Backups remain intact; MH remains intact.

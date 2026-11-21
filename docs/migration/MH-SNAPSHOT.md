@@ -29,8 +29,7 @@ This is a source snapshot, not an upstream merge. Upstream files and modes are p
 
 ## Promotion gate
 
-- Current default branch remains `main`, pointing to the pre-migration HR template backup commit.
-- Active repository ruleset `27663587` targets `~DEFAULT_BRANCH` and requires the status contexts `lint`, `build`, `test`, `cargo test`, and `ci`. The imported tree has no `Cargo.toml`, and its workflow emits different job names.
-- The ruleset has no bypass actors. The available GitHub operations in this session can inspect rulesets but cannot edit them or change the repository's default branch.
-- Promotion is therefore intentionally not performed by moving refs around the active non-fast-forward/deletion rules. The ruleset/default-branch change remains an administrative gate.
-- Backups remain intact; MH remains intact.
+- Default branch promoted to `migration/mh-clean-history`.
+- Repository ruleset `27663587` updated to require the 10 active workflow check contexts (`gateway`, `console`, `runner`, `conformance`, `integration`, `install-pins`, `canary-gate`, `site`, `memories-deploy`, `readme-badge`), removing obsolete checks such as `cargo test`.
+- Backups remain intact (`backup/pre-MH-migration-2026-11-19` in HR and `backup/pre-HR-migration-2026-11-19` in MH); previous `main` ref is preserved.
+- Post-promotion validation: controlled PR to verify ruleset status check enforcement on the promoted default branch.
